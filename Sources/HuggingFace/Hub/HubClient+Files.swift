@@ -16,6 +16,23 @@ import Foundation
 private let xetMinimumFileSizeBytes = 16 * 1024 * 1024  // 16MiB
 private let snapshotUnknownFileWeight: Int64 = 1
 
+/// Per-file download progress for a snapshot, delivered alongside the
+/// aggregate `Progress`. The downloader already tracks a child `Progress` per
+/// file (byte-weighted); this exposes it so a caller can render one row per
+/// file (name + bytes/total) instead of a single aggregate bar. Sampled by the
+/// same 100 ms task that drives `progressHandler`.
+///
+/// Additive and opt-in (default `perFileHandler: nil` ⇒ no behavior change).
+/// Flagged for upstreaming next to PR #50.
+public struct SnapshotFileProgress: Sendable {
+    /// Repo-relative file path (e.g. `model-00001-of-00006.safetensors`).
+    public let path: String
+    /// Bytes written so far for this file.
+    public let completedUnitCount: Int64
+    /// Total bytes expected for this file (0 until known).
+    public let totalUnitCount: Int64
+}
+
 private final class SnapshotProgressBox: @unchecked Sendable {
     let value: Progress
 
@@ -1274,7 +1291,8 @@ public extension HubClient {
         matching globs: [String] = [],
         localFilesOnly: Bool = false,
         maxConcurrentDownloads: Int = 8,
-        progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil
+        progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil,
+        perFileHandler: (@MainActor @Sendable ([SnapshotFileProgress]) -> Void)? = nil
     ) async throws -> URL {
         try await downloadSnapshot(
             of: repo,
@@ -1285,7 +1303,8 @@ public extension HubClient {
             returnCachePath: false,
             localFilesOnly: localFilesOnly,
             maxConcurrentDownloads: maxConcurrentDownloads,
-            progressHandler: progressHandler
+            progressHandler: progressHandler,
+            perFileHandler: perFileHandler
         )
     }
 
@@ -1314,7 +1333,8 @@ public extension HubClient {
         matching globs: [String] = [],
         localFilesOnly: Bool = false,
         maxConcurrentDownloads: Int = 8,
-        progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil
+        progressHandler: (@MainActor @Sendable (Progress) -> Void)? = nil,
+        perFileHandler: (@MainActor @Sendable ([SnapshotFileProgress]) -> Void)? = nil
     ) async throws -> URL {
         try await downloadSnapshot(
             of: repo,
@@ -1325,7 +1345,8 @@ public extension HubClient {
             returnCachePath: true,
             localFilesOnly: localFilesOnly,
             maxConcurrentDownloads: maxConcurrentDownloads,
-            progressHandler: progressHandler
+            progressHandler: progressHandler,
+            perFileHandler: perFileHandler
         )
     }
 
@@ -1338,7 +1359,8 @@ public extension HubClient {
         returnCachePath: Bool,
         localFilesOnly: Bool,
         maxConcurrentDownloads: Int,
-        progressHandler: (@MainActor @Sendable (Progress) -> Void)?
+        progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
+        perFileHandler: (@MainActor @Sendable ([SnapshotFileProgress]) -> Void)? = nil
     ) async throws -> URL {
         let maxConcurrentDownloads = max(1, maxConcurrentDownloads)
         guard cache != nil || destination != nil else {
@@ -1453,9 +1475,15 @@ public extension HubClient {
             }
         let xetEntries = workItems.filter { $0.transport != .lfs }
 
+        // Per-file rows (path + child Progress) for the optional per-file
+        // handler; sampled by the same 100 ms task as the aggregate.
+        let perFileRows: [(path: String, progress: SnapshotProgressBox)] =
+            workItems.map { ($0.entry.path, $0.progress) }
         let samplingTask = makeSnapshotProgressSamplingTask(
             progress: progress,
-            progressHandler: progressHandler
+            progressHandler: progressHandler,
+            perFileRows: perFileRows,
+            perFileHandler: perFileHandler
         )
 
         do {
@@ -1571,15 +1599,28 @@ private extension HubClient {
 
     func makeSnapshotProgressSamplingTask(
         progress: Progress,
-        progressHandler: (@MainActor @Sendable (Progress) -> Void)?
+        progressHandler: (@MainActor @Sendable (Progress) -> Void)?,
+        perFileRows: [(path: String, progress: SnapshotProgressBox)] = [],
+        perFileHandler: (@MainActor @Sendable ([SnapshotFileProgress]) -> Void)? = nil
     ) -> Task<Void, Never>? {
-        guard let progressHandler else {
+        guard progressHandler != nil || perFileHandler != nil else {
             return nil
         }
         let boxedProgress = SnapshotProgressBox(progress)
         return Task(priority: Task.currentPriority) {
             while !Task.isCancelled {
-                await progressHandler(boxedProgress.value)
+                if let progressHandler {
+                    await progressHandler(boxedProgress.value)
+                }
+                if let perFileHandler {
+                    let snap = perFileRows.map { row in
+                        SnapshotFileProgress(
+                            path: row.path,
+                            completedUnitCount: row.progress.value.completedUnitCount,
+                            totalUnitCount: row.progress.value.totalUnitCount)
+                    }
+                    await perFileHandler(snap)
+                }
                 try? await Task.sleep(for: .milliseconds(100))
             }
         }
