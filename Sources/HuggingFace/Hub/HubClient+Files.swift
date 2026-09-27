@@ -31,7 +31,9 @@ public struct SnapshotFileProgress: Sendable {
     /// Repo-relative file path (e.g. `model-00001-of-00006.safetensors`).
     public let path: String
     /// Size in bytes as declared by the repo's tree listing, or `nil` when the
-    /// listing does not declare one.
+    /// listing does not declare one. Rows for a snapshot served from cache are
+    /// also `nil` when no snapshot metadata was saved for its commit; only a
+    /// download requested by commit hash saves it, not one by branch or tag.
     ///
     /// This is the tree entry's own value, not a running count: it is stable
     /// for the whole download and is the figure to render a row's total from.
@@ -1600,7 +1602,9 @@ public extension HubClient {
         let fileRows: [(path: String, size: Int64?, progress: SnapshotProgressBox)] =
             fileProgressHandler == nil
             ? []
-            : workItems.map { ($0.entry.path, $0.entry.size.map(Int64.init), $0.progress) }
+            : workItems
+                .filter { $0.entry.type == .file }
+                .map { ($0.entry.path, $0.entry.size.map(Int64.init), $0.progress) }
         let samplingTask = makeSnapshotProgressSamplingTask(
             progress: progress,
             progressHandler: progressHandler,

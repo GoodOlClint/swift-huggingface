@@ -1674,10 +1674,13 @@ import Testing
         /// emission before the terminal one.
         private func perFileProgressHandler(
             commit: String,
-            holdFirstRequestFor delay: TimeInterval
+            holdFirstRequestFor delay: TimeInterval,
+            includeDirectory: Bool = false
         ) -> @Sendable (URLRequest) throws -> (HTTPURLResponse, Data) {
+            let directoryEntry = includeDirectory ? #"{"path": "sub", "type": "directory", "oid": "c"},"# : ""
             let listResponse = """
                 [
+                    \(directoryEntry)
                     {"path": "large.bin", "type": "file", "oid": "a", "size": 900},
                     {"path": "small.bin", "type": "file", "oid": "b", "size": 100}
                 ]
@@ -1740,7 +1743,7 @@ import Testing
         func testDownloadSnapshotReportsPerFileProgress() async throws {
             let commit = "1234567890123456789012345678901234567890"
             await MockURLProtocol.setHandler(
-                perFileProgressHandler(commit: commit, holdFirstRequestFor: 0.25)
+                perFileProgressHandler(commit: commit, holdFirstRequestFor: 0.25, includeDirectory: true)
             )
 
             let recorder = PerFileProgressRecorder()
